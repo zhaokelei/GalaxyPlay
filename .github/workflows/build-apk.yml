@@ -1,0 +1,188 @@
+name: Build APK
+
+# 产出可安装 APK 的自动构建流程。
+#
+# 自动触发：push 到 main 构建 source-only 调试包并上传 artifact。
+#   该包不含 CarPlay 认证身份，可安装运行；连接 iPhone 前需在应用内导入认证材料。
+#
+# 手动触发（workflow_dispatch）可选：
+#   debug               source-only 调试包（无需 Secrets）
+#   standalone-debug    内置 MFi 认证实车调试包（需认证 Secrets）
+#   release             签名发布包（需签名 Secrets，不含内置认证）
+#   standalone-release  内置认证 + 签名的发布包（需全部 Secrets）
+#
+# 依赖的 GitHub Secrets（全部可选；缺失时对应构建在预检阶段失败并提示）：
+#   GALAXY_AUTH_ASSETS_TAR_B64    认证材料 tar.gz 的 base64，
+#                                 解包后须含 offline-mfi/identity.pk8 与 offline-mfi/certificate.p7b
+#   GALAXY_ANDROID_KEYSTORE_B64   发布签名 keystore 的 base64
+#   GALAXY_KEYSTORE_PASSWORD      keystore 口令
+#   GALAXY_KEY_ALIAS              签名密钥别名
+#   GALAXY_KEY_PASSWORD           签名密钥口令
+#
+# 安全提示：standalone 包把认证身份打进 APK，任何获得 APK 的人均可提取其中材料；
+# 公开仓库的 workflow artifact 可被任何人下载，请评估风险后再配置认证 Secrets。
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 构建类型（standalone / release 需配置对应 Secrets）
+        type: choice
+        required: true
+        default: debug
+        options:
+          - debug
+          - standalone-debug
+          - release
+          - standalone-release
+
+permissions:
+  contents: read
+
+env:
+  SDK_PACKAGES: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ${{ env.SDK_PACKAGES }}
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: 还原 CarPlay 认证材料（可选 Secrets）
+        id: auth
+        env:
+          AUTH_TAR_B64: ${{ secrets.GALAXY_AUTH_ASSETS_TAR_B64 }}
+        run: |
+          if [ -z "$AUTH_TAR_B64" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          auth_dir="$RUNNER_TEMP/galaxyplay-auth"
+          mkdir -p "$auth_dir"
+          echo "$AUTH_TAR_B64" | base64 -d | tar -xz -C "$auth_dir"
+          for file in identity.pk8 certificate.p7b; do
+            if [ ! -s "$auth_dir/offline-mfi/$file" ]; then
+              echo "::error::认证包缺少 offline-mfi/$file，请检查 GALAXY_AUTH_ASSETS_TAR_B64 的目录结构。" >&2
+              exit 1
+            fi
+          done
+          echo "dir=$auth_dir" >> "$GITHUB_OUTPUT"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: 还原发布签名 keystore（可选 Secrets）
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.GALAXY_ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          keystore_path="$RUNNER_TEMP/galaxyplay-release.jks"
+          echo "$KEYSTORE_B64" | base64 -d > "$keystore_path"
+          echo "path=$keystore_path" >> "$GITHUB_OUTPUT"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: 确定构建任务并预检 Secrets
+        id: plan
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+          AUTH_AVAILABLE: ${{ steps.auth.outputs.available }}
+          SIGNING_AVAILABLE: ${{ steps.signing.outputs.available }}
+        run: |
+          build_type="$BUILD_TYPE"
+          if [ -z "$build_type" ]; then
+            # push 自动触发固定构建 source-only 调试包，不消耗认证材料。
+            build_type=debug
+          fi
+          case "$build_type" in
+            debug)
+              gradle_task=":mobile:assembleDebug" ;;
+            standalone-debug)
+              gradle_task=":mobile:assembleStandaloneDebug"
+              if [ "$AUTH_AVAILABLE" != "true" ]; then
+                echo "::error::构建 $build_type 需要认证 Secrets GALAXY_AUTH_ASSETS_TAR_B64。" >&2
+                exit 1
+              fi ;;
+            release)
+              gradle_task=":mobile:assembleRelease"
+              if [ "$SIGNING_AVAILABLE" != "true" ]; then
+                echo "::error::构建 $build_type 需要签名 Secrets GALAXY_ANDROID_KEYSTORE_B64 及配套口令。" >&2
+                exit 1
+              fi ;;
+            standalone-release)
+              gradle_task=":mobile:assembleStandaloneRelease"
+              if [ "$AUTH_AVAILABLE" != "true" ] || [ "$SIGNING_AVAILABLE" != "true" ]; then
+                echo "::error::构建 $build_type 需要认证与签名两组 Secrets。" >&2
+                exit 1
+              fi ;;
+            *)
+              echo "::error::未知构建类型：$build_type" >&2
+              exit 1 ;;
+          esac
+          echo "build_type=$build_type" >> "$GITHUB_OUTPUT"
+          echo "gradle_task=$gradle_task" >> "$GITHUB_OUTPUT"
+
+      - name: 构建 APK
+        run: |
+          # 仅在对应 Secrets 可用时导出变量；空字符串环境变量会被 Gradle 视为已配置。
+          if [ "${{ steps.auth.outputs.available }}" = "true" ]; then
+            export DIPLAY_AUTH_ASSETS_DIR="${{ steps.auth.outputs.dir }}"
+          fi
+          if [ "${{ steps.signing.outputs.available }}" = "true" ]; then
+            export ANDROID_KEYSTORE_PATH="${{ steps.signing.outputs.path }}"
+            export ANDROID_KEYSTORE_PASSWORD="${{ secrets.GALAXY_KEYSTORE_PASSWORD }}"
+            export ANDROID_KEY_ALIAS="${{ secrets.GALAXY_KEY_ALIAS }}"
+            export ANDROID_KEY_PASSWORD="${{ secrets.GALAXY_KEY_PASSWORD }}"
+          fi
+          ./gradlew ${{ steps.plan.outputs.gradle_task }} --stacktrace
+
+      - name: 检查 DEX 压缩
+        run: python3 e2e/checks/check_apk_dex_compression.py mobile/build/outputs/apk/*/*.apk
+
+      - name: 生成 SHA256 校验和
+        run: |
+          for apk in mobile/build/outputs/apk/*/*.apk; do
+            (cd "$(dirname "$apk")" && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
+          done
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: galaxyplay-${{ steps.plan.outputs.build_type }}-run${{ github.run_number }}
+          path: |
+            mobile/build/outputs/apk/*/*.apk
+            mobile/build/outputs/apk/*/*.apk.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 输出构建摘要
+        run: |
+          {
+            echo "### GalaxyPlay APK 构建完成"
+            echo "- 构建类型：\`${{ steps.plan.outputs.build_type }}\`"
+            echo "- Gradle 任务：\`${{ steps.plan.outputs.gradle_task }}\`"
+            echo "- 内置 MFi 认证：\`${{ steps.auth.outputs.available }}\`"
+            echo "- 外部签名：\`${{ steps.signing.outputs.available }}\`"
+            echo "- SHA256："
+            for sum in mobile/build/outputs/apk/*/*.apk.sha256; do
+              echo "  - \`$(cat "$sum")\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
